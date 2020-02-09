@@ -10,6 +10,11 @@
 		ABORTED: 'ABORTED',
 		UNKNOWN: 'UNKNOWN'
 	};
+	let buildResult = {
+		SUCCESS:  'SUCCESS',
+		FAILURE:  'FAILURE',
+		UNSTABLE: 'UNSTABLE',
+	};
 	let buildInfos = {};
 	let myName = '';
 	let highlightedNames = [];
@@ -21,23 +26,31 @@
 	let purpleCommitMessagePattern = '';
 	let buildNumberDomElms = document.querySelectorAll('.build-row-cell .pane.build-name .display-name');
 
-	function getInfo(url, cb, prm) {
-		let xhr = new XMLHttpRequest();
-		xhr.onreadystatechange = function() {
-			if (xhr.readyState === 4) {
-				try {
-					let json = JSON.parse(xhr.response);
-					cb(json, prm);
-				} catch(err) {
-				}
-			}
-		};
-		xhr.onerror = function() {
-			alert('err');
-		};
-		xhr.open('GET', url, true);
-	    xhr.send('');
+	async function goFetch(url, asJson = true) {
+		try {
+			const res = await fetch(url);
+			return asJson ? await res.json() : await res.text();
+		} catch {
+		}
 	}
+
+	// function getInfo(url, cb, prm) {
+	// 	let xhr = new XMLHttpRequest();
+	// 	xhr.onreadystatechange = function() {
+	// 		if (xhr.readyState === 4) {
+	// 			try {
+	// 				let json = JSON.parse(xhr.response);
+	// 				cb(json, prm);
+	// 			} catch(err) {
+	// 			}
+	// 		}
+	// 	};
+	// 	xhr.onerror = function() {
+	// 		alert('err');
+	// 	};
+	// 	xhr.open('GET', url, true);
+	//     xhr.send('');
+	// }
 
 	function formatCommiterName(commitAuthor) {
 		let commiterName = commitAuthor.replace(/[,]/g, '');
@@ -112,7 +125,7 @@
 		mailLinkElm.appendChild(mailImgElm);
 		commiterLineElm.appendChild(mailLinkElm);
 
-		let nameElm = document.createElement('span');
+		let nameElm = document.createElement('div');
 		nameElm.className = 'jenkins-ext-build-commiter-name';
 		if (ci.name.toLowerCase().trim() === myName) {
 			nameElm.className += ' jenkins-ext-build-commiter-name--me';
@@ -269,6 +282,84 @@
 		}
 	}
 
+	function displayBuildProblem(buildNumber, problem) {
+		let buildLinkElm = getBuildLinkElement(buildNumber);
+		if (!buildLinkElm) {
+			return;
+		}
+		let parentElm = buildLinkElm.parentElement.parentElement.parentElement;
+		let problemLineElm = document.createElement('div');
+		problemLineElm.className = 'jenkins-ext-build-problem-line';
+
+		let problemLinkElm = document.createElement('a');
+		problemLinkElm.setAttribute('href', `/${problem.url}consoleFull`);
+		problemLinkElm.setAttribute('target', '_blank');
+		problemLinkElm.setAttribute('title', 'View console log');
+
+		let consoleImgElm = document.createElement('img');
+		consoleImgElm.setAttribute('src', chrome.extension.getURL('img/terminal.png'));
+		consoleImgElm.className = 'jenkins-ext-build-problem-console-img';
+		problemLinkElm.appendChild(consoleImgElm);
+
+		problemLineElm.appendChild(problemLinkElm);
+
+		let problemTextElm = document.createElement('div');
+		problemTextElm.innerText = problem.jobName;
+		problemTextElm.className = 'jenkins-ext-build-problem-text';
+		problemLineElm.appendChild(problemTextElm);
+
+		parentElm.appendChild(problemLineElm);
+	}
+
+	function getFirstProblem(buildNumber, rec) {
+		if (rec.result && rec.result !== buildResult.FAILURE && rec.result !== buildResult.UNSTABLE) {
+			return null;
+		} else if (rec.build && rec.build.subBuilds && rec.build.subBuilds.length > 0) {
+			return getFirstProblem(buildNumber, rec.build);
+		} else if (rec.subBuilds && rec.subBuilds.length > 0) {
+			let problem = null;
+			rec.subBuilds.forEach(sb => {
+				if (!problem) {
+					problem = getFirstProblem(buildNumber, sb);
+				}
+			});
+			return problem;
+		} else {
+			console.log(buildNumber + ' ' + rec.result + ' ' + rec.jobName);
+			return rec;
+		}
+	}
+
+	async function getFirstProblemLastSuccess(firstProblem) {
+		const MAX_NUM_OF_BUILDS_TO_INSPECT = 20;
+		let lastSuccess = null;
+		let i = 1;
+		do {
+			const n = firstProblem.buildNumber - i;
+			const bUrl = firstProblem.url.replace(`/${firstProblem.buildNumber}/`, `/${n}/`);
+			const json = await goFetch(`/${bUrl}api/json`);
+			if (json && json.result === buildResult.SUCCESS) {
+				lastSuccess = json;
+			}
+			i++;
+		} while (!lastSuccess && i <= MAX_NUM_OF_BUILDS_TO_INSPECT);
+		return lastSuccess;
+	}
+
+	function investigateProblem(bi) {
+		(async () => {
+			const firstProblem = bi.firstProblem;
+			bi.firstProblemLastSuccess = await getFirstProblemLastSuccess(firstProblem);
+			if (bi.firstProblemLastSuccess) {
+				const problemText = await goFetch(`/${firstProblem.url}consoleText`, false);
+				const successUrl = firstProblem.url.replace(`/${firstProblem.buildNumber}/`, `/${bi.firstProblemLastSuccess.number}/`);
+			 	const successText = await goFetch(`/${successUrl}consoleText`, false);
+				console.log(problemText);
+				console.log(successText);
+			}
+		})();
+	}
+
 	function onGetBuildInfoDone(json, buildNumber) {
 		let bi = buildInfos[buildNumber];
 		bi.commiterInfos = [];
@@ -301,6 +392,14 @@
 		bi.commiterInfos.sort((a, b) => {
 			return a.name.localeCompare(b.name);
 		});
+		if (json.result === buildResult.FAILURE || json.result === buildResult.UNSTABLE) {
+			const firstProblem = getFirstProblem(buildNumber, json);
+			if (firstProblem && firstProblem.url && firstProblem.jobName) {
+				bi.firstProblem = firstProblem;
+				displayBuildProblem(buildNumber, firstProblem);
+				investigateProblem(bi);
+			}
+		}
 		displayBuildCommiters(buildNumber);
 	}
 
@@ -311,7 +410,10 @@
 					number: build.number,
 					url: build.url
 				};
-				getInfo(build.url + 'api/json', onGetBuildInfoDone, build.number);
+				(async () => {
+					const json = await goFetch(build.url + 'api/json');
+					onGetBuildInfoDone(json, build.number);
+				})();
 			});
 			info.builds.forEach(build => {
 				buildInfos[build.number].status = getBuildStatus(build.number);
@@ -346,7 +448,11 @@
 			blueCommitMessagePattern = (request.blueCommitMessagePattern || '').trim();
 			purpleCommitMessagePattern = (request.purpleCommitMessagePattern || '').trim();
 			const baseLocation = document.location.href.replace(/\?\S*/, '');
-			getInfo(baseLocation + 'api/json', onGetRootJobInfoDone, null);
+			(async () => {
+				const json = await goFetch(baseLocation + 'api/json');
+				onGetRootJobInfoDone(json);
+			})();
+
 			// setTimeout(() => {
 			// 	observeDOM(document.getElementById('buildHistory'), () => {
 			// 		// console.log('build history was changed');
