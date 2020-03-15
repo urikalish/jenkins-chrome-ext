@@ -1,4 +1,4 @@
-const ON_PROBLEM_MAX_NUM_OF_BUILDS_TO_INSPECT = 10;
+const ON_PROBLEM_MAX_NUM_OF_BUILDS_TO_INSPECT = 20;
 let linesCache = {};
 
 async function goFetchText(url) {
@@ -36,6 +36,12 @@ function addProblems(problems, buildNumber, rec) {
 	}
 }
 
+function addClickHandler(elm, cb, ...params) {
+	elm.addEventListener('click', async () => {
+		cb(params).then();
+	}, false);
+}
+
 function displayBuildProblem(buildNumber, problem) {
 	let buildLinkElm = getBuildLinkElement(buildNumber);
 	if (!buildLinkElm) {
@@ -51,17 +57,28 @@ function displayBuildProblem(buildNumber, problem) {
 	}
 	problemLineElm.className = `jenkins-ext-build-problem-line ${statusStyle}`;
 
-	let problemLinkElm = document.createElement('a');
-	problemLinkElm.setAttribute('href', `/${problem.url}consoleFull`);
-	problemLinkElm.setAttribute('target', '_blank');
-	problemLinkElm.setAttribute('title', 'View console log');
+	// let problemLinkElm = document.createElement('a');
+	// problemLinkElm.setAttribute('href', `/${problem.url}consoleFull`);
+	// problemLinkElm.setAttribute('target', '_blank');
+	// problemLinkElm.setAttribute('title', 'View full console output');
+	// let consoleImgElm = document.createElement('img');
+	// consoleImgElm.setAttribute('id', `jenkins-ext-build-problem-terminal-img-${buildNumber}-${problem.jobName.toLowerCase()}`);
+	// consoleImgElm.setAttribute('src', chrome.extension.getURL('img/terminal.png'));
+	// consoleImgElm.className = 'jenkins-ext-build-problem-console-img';
+	// problemLinkElm.appendChild(consoleImgElm);
+	// problemLineElm.appendChild(problemLinkElm);
 
-	let consoleImgElm = document.createElement('img');
-	consoleImgElm.setAttribute('src', chrome.extension.getURL('img/terminal.png'));
-	consoleImgElm.className = 'jenkins-ext-build-problem-console-img';
-	problemLinkElm.appendChild(consoleImgElm);
-
-	problemLineElm.appendChild(problemLinkElm);
+	if (problem.url && problem.jobName) {
+		let consoleErrImgElm = document.createElement('img');
+		//consoleErrImgElm.setAttribute('id', `jenkins-ext-build-problem-terminal-err-img-${buildNumber}-${problem.jobName.toLowerCase()}`);
+		consoleErrImgElm.setAttribute('data-url-console-full', `/${problem.url}consoleFull`);
+		consoleErrImgElm.setAttribute('data-build-number', buildNumber);
+		consoleErrImgElm.setAttribute('data-job-name', problem.jobName);
+		consoleErrImgElm.setAttribute('src', chrome.extension.getURL('img/terminal-err.png'));
+		consoleErrImgElm.className = 'jenkins-ext-build-problem-console-err-img';
+		addClickHandler(consoleErrImgElm, investigateBuildProblem, problem);
+		problemLineElm.appendChild(consoleErrImgElm);
+	}
 
 	let problemTextElm = document.createElement('div');
 	problemTextElm.innerText = problem.jobName;
@@ -71,85 +88,126 @@ function displayBuildProblem(buildNumber, problem) {
 	parentElm.appendChild(problemLineElm);
 }
 
-async function getProblemLastSuccess(problem) {
-	let lastSuccess = null;
-	let goOn = true;
-	let i = 1;
-	do {
-		const n = problem.buildNumber - i;
-		const bUrl = problem.url.replace(`/${problem.buildNumber}/`, `/${n}/`);
-		const json = await goFetchJson(`/${bUrl}api/json`);
-		if (!json) {
-			goOn = false;
-		} else if (json.result === buildResult.SUCCESS) {
-			lastSuccess = json;
-			goOn = false;
-		} else {
-			i++;
+async function getProblemLastSuccesses(problem) {
+	let lastSuccesses = [];
+	const promises = [];
+	for (let i = 1; i <= ON_PROBLEM_MAX_NUM_OF_BUILDS_TO_INSPECT; i++) {
+		const bUrl = problem.url.replace(`/${problem.buildNumber}/`, `/${problem.buildNumber - i}/`);
+		promises.push(goFetchJson(`/${bUrl}api/json`));
+	}
+	const results = await Promise.all(promises);
+	results.forEach(json => {
+		if (json && json.result === buildResult.SUCCESS) {
+			lastSuccesses.push(json);
 		}
-	} while (goOn && i <= ON_PROBLEM_MAX_NUM_OF_BUILDS_TO_INSPECT);
-	return lastSuccess;
+	});
+	return lastSuccesses;
 }
 
-async function getMeaningfulLines(...textUrls) {
-	const result = [];
-	const promises = [];
-	textUrls.forEach(u => {
-		promises.push(goFetchText(u),);
-	});
-	const textResults = await Promise.all(promises);
-	for (let i = 0; i < textUrls.length; i++) {
-		if (!linesCache[textUrls[i]]) {
-			linesCache[textUrls[i]] = textResults[i].split('\n').filter(l => l.length>0 && !/^\[INFO]/.test(l));
-		}
-		result.push(linesCache[textUrls[i]]);
+async function getMeaningfulLines(textUrl) {
+	const textResult = await goFetchText(textUrl);
+	if (!linesCache[textUrl]) {
+		linesCache[textUrl] = textResult.split('\n').filter(l =>
+			l.length > 0
+			&& /[a-zA-Z0-9]+/.test(l)
+			&& !/^\[?(INFO|WARN|WARNING)[\] ]/.test(l)
+			);
 	}
-	return result;
+	return linesCache[textUrl];
 }
 
 function getLinesHash(line) {
 	return hash(line
-		.replace(/[0-9a-f]{8,}/g,'G')
-		.replace(/[0-9]+?/g,'D'));
+		.replace(/[-_,;:.'"|~!@#$%^&*()=+?<>/\\[\]]{}/g,' ')
+		.replace(/\d\s|\d+\S+\d*\S*|\S+\d+\d*\S*/g,'D'));
 }
 
-async function investigateProblem(problem) {
-	if (!problem.url || !problem.jobName) {
-		return;
+function showProblemDialog(problem) {
+	let problemDialogElm = document.getElementById('jenkins-ext-build-problem-dialog');
+	if (problemDialogElm) {
+		problemDialogElm.innerHTML = '';
+	} else {
+		problemDialogElm = document.createElement('div');
+		problemDialogElm.setAttribute('id', 'jenkins-ext-build-problem-dialog');
+		problemDialogElm.className = 'jenkins-ext-build-problem-dialog';
 	}
-	problem.lastSuccess = await getProblemLastSuccess(problem);
-	if (problem.lastSuccess) {
+
+	let consoleLinkElm = document.createElement('a');
+	consoleLinkElm.setAttribute('href', `/${problem.url}consoleFull`);
+	consoleLinkElm.setAttribute('target', '_blank');
+	consoleLinkElm.innerText = 'Open full console output';
+	consoleLinkElm.className = 'jenkins-ext-build-problem-dialog-console-link';
+	problemDialogElm.appendChild(consoleLinkElm);
+
+	let closeElm = document.createElement('button');
+	closeElm.className = 'jenkins-ext-build-problem-dialog-close-btn';
+	closeElm.innerText = 'x';
+	closeElm.addEventListener('click', () => {
+		problemDialogElm.classList.add('jenkins-ext-hidden');
+	});
+	problemDialogElm.appendChild(closeElm);
+
+	let problemLinesElm = document.createElement('div');
+	problemLinesElm.className = 'jenkins-ext-build-problem-dialog-lines';
+	problemDialogElm.appendChild(problemLinesElm);
+	document.body.appendChild(problemDialogElm);
+	problemDialogElm.classList.remove('jenkins-ext-hidden');
+	return problemLinesElm;
+}
+
+function populateProblemDialog(problemLinesElm, problem, uniqueProblemLines) {
+	uniqueProblemLines.forEach(lineText => {
+		let lineElm = document.createElement('div');
+		lineElm.innerText = lineText;
+		if (/fata|error|failure|failed|exception|unstable/ig.test(lineText)) {
+			lineElm.className = 'jenkins-ext-build-problem-dialog-line jenkins-ext-build-problem-dialog-line--err';
+		} else {
+			lineElm.className = 'jenkins-ext-build-problem-dialog-line';
+		}
+		problemLinesElm.appendChild(lineElm);
+	});
+	problemLinesElm.style['cursor'] = 'text';
+}
+
+async function investigateBuildProblem(params) {
+	const [problem] = params;
+	problem.lastSuccesses = await getProblemLastSuccesses(problem);
+	if (problem.lastSuccesses.length === 0) {
+		window.open(`/${problem.url}consoleFull`);
+	} else {
+		const problemLinesElm = showProblemDialog(problem);
 		const problemTextUrl = `/${problem.url}consoleText`;
-		const successTextUrl = `/${problem.url.replace(`/${problem.buildNumber}/`, `/${problem.lastSuccess.number}/`)}consoleText`;
-		const [problemLinesText, successLinesText] = await getMeaningfulLines(problemTextUrl, successTextUrl);
+		const problemLinesText = await getMeaningfulLines(problemTextUrl);
 		const problemLinesHash = [];
 		problemLinesText.forEach(l => {
 			problemLinesHash.push(getLinesHash(l));
 		});
 		const successLinesHashSet = new Set();
-		successLinesText.forEach(l => {
-			successLinesHashSet.add(getLinesHash(l));
-		});
-		console.log(`########## ${problem.jobName} F:${problem.buildNumber} S:${problem.lastSuccess.number}`);
-		for (let i = 0; i < problemLinesText.length; i++) {
-			if (!successLinesHashSet.has(problemLinesHash[i])) {
-				console.log(problemLinesText[i]);
-			}
+		for (let i = 0; i < problem.lastSuccesses.length; i++) {
+			const successTextUrl = `/${problem.url.replace(`/${problem.buildNumber}/`, `/${problem.lastSuccesses[i].number}/`)}consoleText`;
+			const successLinesText = await getMeaningfulLines(successTextUrl);
+			successLinesText.forEach(l => {
+				successLinesHashSet.add(getLinesHash(l));
+			});
 		}
-	} else {
-		//const problemLines = await getMeaningfulLines(problemTextUrl);
-		//console.log(`${problem.jobName} P:${problem.buildNumber} S:NA`);
+		const uniqueProblemLines = [];
+		problemLinesHash.forEach((l, i) => {
+			if (!successLinesHashSet.has(l)) {
+				uniqueProblemLines.push(`${problemLinesText[i]}`);
+			}
+		});
+		populateProblemDialog(problemLinesElm, problem, uniqueProblemLines);
 	}
 }
 
-async function investigateAllProblems() {
-	const buildNumbers = Object.keys(buildInfos)
-	.filter(k => buildInfos[k].problems && buildInfos[k].problems.length > 0);
-	const promises = [];
-	for (let i = buildNumbers.length - 1; i >= 0; i--) {
-		for (let j = 0; j < buildInfos[buildNumbers[i]].problems.length; j++) {
-			promises.push(investigateProblem(buildInfos[buildNumbers[i]].problems[j]));
-		}
-	}
-	await Promise.all(promises);
-}
+// async function investigateAllProblems() {
+// 	const buildNumbers = Object.keys(buildInfos)
+// 	.filter(k => buildInfos[k].problems && buildInfos[k].problems.length > 0);
+// 	const promises = [];
+// 	buildNumbers.forEach((bn) => {
+// 		buildInfos[bn].problems.forEach(p => {
+// 			promises.push(investigateProblem(bn, p));
+// 		});
+// 	});
+// 	await Promise.all(promises);
+// }

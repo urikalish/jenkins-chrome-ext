@@ -33,12 +33,14 @@ function onGetBuildInfoDone(json, buildNumber) {
 	if (json.result === buildResult.FAILURE || json.result === buildResult.UNSTABLE) {
 		bi.problems = [];
 		addProblems(bi.problems, buildNumber, json);
-		for (let i = 0; i < bi.problems.length; i++) {
-			const p = bi.problems[i];
+		bi.problems.sort(function (a, b) {
+			return a.jobName.localeCompare(b.jobName);
+		});
+		bi.problems.forEach((p) => {
 			if (p.url && p.jobName) {
 				displayBuildProblem(buildNumber, p);
 			}
-		}
+		});
 	}
 	displayBuildCommiters(buildNumber);
 }
@@ -64,7 +66,6 @@ async function onGetRootJobInfoDone(info) {
 		promises.push(handleBuildInfo(build));
 	});
 	await Promise.all(promises);
-	//await investigateAllProblems();
 }
 
 // function updateRunningBuilds() {
